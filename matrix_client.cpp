@@ -388,7 +388,7 @@ int MATRIXClient::insertWaitQ(TaskDAG &dag, int &numSleep, int &num_tasks, int &
 
 	int num_worker = clientRet.memberList.size();
         int toserver = (num_worker-1)/(selfindex+1); // Server index where the tasks will be initially submitted to the Wait queue
-        //cout << "to server = " << toserver << endl;
+        cout << "to server = " << toserver << endl;
 
 	//cout << "num_tasks = " << num_tasks << endl;
 
@@ -457,7 +457,7 @@ int MATRIXClient::initializeTasks(int num_tasks_req, int numSleep, int computeSl
 	total_num_tasks = num_tasks * num_worker;
 	print_DAG(dag);
 
-	//insertNoVoHT(dag, num_tasks, numSleep, clientRet);
+	insertNoVoHT(dag, num_tasks, numSleep, clientRet);
 	//exit(1);
 	
 	insertWaitQ(dag, numSleep, num_tasks, computeSlots, max_tasks_per_package, clientRet);

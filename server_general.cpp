@@ -866,7 +866,7 @@ void dataService(int client_sock, void* buff, sockaddr_in fromAddr,
                         operation_status = -1;
                 } else {
                         //cout << "check if task is ready..." << endl;
-			ret = worker->check_if_task_is_ready(package.virtualpath());
+			ret = worker->checkIfTaskIsReady(package.virtualpath());
                 }
 
                 if (TCP == true) {
@@ -976,28 +976,21 @@ void dataService(int client_sock, void* buff, sockaddr_in fromAddr,
 		break;*/
 		
 	case 13: {
-		//get load information
-		int32_t load;
+		// free slots
+		int32_t ret;
 		if (package.virtualpath().empty()) {
 			operation_status = -1;
 		} else {
-			//load = ready_queue->get_length() - worker.num_idle_cores;	// Get the current load
-			load = worker->get_load_info();
-			//load = rqueue.size() - worker->num_idle_cores;     // Get the current load
-			//cout << "loadinfo: worker_id = " << worker->selfIndex << " rqueue = " << rqueue.size() << " mqueue = " << mqueue.size() << " load = " << load << endl;
+			string task_id(package.virtualpath());
+			ret = worker->freeLockedSlots(task_id);
 		}
-
-		//buff1 = &operation_status;
 
 		msg_count[4]++;
 
 		if (TCP == true) {
-			if(LOGGING) {
-				log_fp << "LOAD INFORMATION = " << load << endl;
-			}
-			r = send(client_sock, &load, sizeof(int32_t), 0);
+			r = send(client_sock, &ret, sizeof(int32_t), 0);
 		} else {
-			r = sendto(client_sock, &load, sizeof(int32_t), 0,
+			r = sendto(client_sock, &ret, sizeof(int32_t), 0,
 					(struct sockaddr *) &fromAddr, sizeof(struct sockaddr));
 		}
 
@@ -1005,75 +998,39 @@ void dataService(int client_sock, void* buff, sockaddr_in fromAddr,
 
 		if (r <= 0) {
 			cout
-					<< "Load information: Server could not send load information to client: sendto r = "
+					<< "free slots: Server could not send acknowledgement to client: sendto r = "
 					<< r << endl;
 		}
 	}
 		break;
 
 	case 14: {
-		//steal tasks
-		int32_t num_task;
+		//steal slots
+		int32_t num_slots;
 		if (package.virtualpath().empty()) {
 			operation_status = -1;
 		} else {
-			
-			//num_task = (ready_queue->get_length() - worker.num_idle_cores)/2;	// Get the current load
-			num_task = worker->get_numtasks_to_steal();
-			//num_task = (rqueue.size() - worker->num_idle_cores)/2;     // Get the current load
-			
+			string task_id(package.virtualpath());
+			num_slots = worker->getHalfSlots(task_id);
+			if(num_slots < 1) {
+				num_slots = 0;
+			}
 		}
 		msg_count[5]++;
 
-		//cout << "server_general: Sending " << num_task << " tasks" << endl;
-		//buff1 = &operation_status;
 		if (TCP == true) {
-			r = send(client_sock, &num_task, sizeof(int32_t), 0);
+			r = send(client_sock, &num_slots, sizeof(int32_t), 0);
 		} else {
-			r = sendto(client_sock, &num_task, sizeof(int32_t), 0,
+			r = sendto(client_sock, &num_slots, sizeof(int32_t), 0,
 					(struct sockaddr *) &fromAddr, sizeof(struct sockaddr));
 		}
 		msg_count[5]++;
 
 		if (r <= 0) {
 			cout
-					<< "Steal tasks: Server could not send no. of tasks to client: sendto r = "
+					<< "Steal slots: Server could not send no. of tasks to client: sendto r = "
 					<< r << endl;
 		}
-
-
-		if(num_task > 0) {
-			
-			//string dest_index_str = package.virtualpath();
-			//int *index = new int(atoi(dest_index_str.c_str()));
-			int index = atoi(package.virtualpath().c_str());
-			//cout << "server_general: worker = " << worker->selfIndex << " to index = " << index << endl;
-			if(LOGGING) {
-				log_fp << "Sending " << num_task << " tasks... to index " << index << "\n";
-			}
-			//worker.migrateTasks(num_task, worker.svrclient, index);
-			pthread_mutex_lock(&mq_lock);
-                        //migrateq.push(index);
-			migratev.set(index);
-			//cout << "worker = " << worker.selfIndex << " to index = " << index << " size = " << migrateq.size() << endl;
-                        pthread_mutex_unlock(&mq_lock);
-                        /*pthread_t *migrate_thread;
-			try {
-				migrate_thread = new pthread_t();
-			}
-			catch (std::bad_alloc& exc) {
-                                cout << "migrate_tasks: cannot allocate memory for migrate_thread" << endl;
-                                break;
-                        }
-			//pthread_t migrate_thread;
-                        err = pthread_create(migrate_thread, &attr, migrateTasks, (void *)index);
-                        if(err){
-                                printf("StealTasks: pthread_create: %s\n", strerror(errno));
-                                exit(1);
-                        }
-			delete migrate_thread;*/
-		}
-		
 	}
 		break;
 

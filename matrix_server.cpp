@@ -9,13 +9,16 @@ Worker::~Worker() {
 
 }
 
+static LockComputeNodes lockedNodes;
+static ComputeNodesStatus nodeStatus;
+
 TaskQueue wqueue;
 TaskQueue rqueue;
 TaskQueue mqueue;
 CompQueue cqueue;
 static pthread_mutex_t w_lock = PTHREAD_MUTEX_INITIALIZER;              // Lock for the "wait queue"
-static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;                // Lock for the "ready queue"
-static pthread_mutex_t c_lock = PTHREAD_MUTEX_INITIALIZER;                // Lock for the "complete queue"
+static pthread_mutex_t r_lock = PTHREAD_MUTEX_INITIALIZER;              // Lock for the "ready queue"
+static pthread_mutex_t c_lock = PTHREAD_MUTEX_INITIALIZER;              // Lock for the "complete queue"
 static pthread_mutex_t m_lock = PTHREAD_MUTEX_INITIALIZER;              // Lock for the "migrate queue"
 static pthread_mutex_t mutex_idle = PTHREAD_MUTEX_INITIALIZER;          // Lock for the "num_idle_cores"
 static pthread_mutex_t mutex_finish = PTHREAD_MUTEX_INITIALIZER;        // Lock for the "finish file"
@@ -45,13 +48,6 @@ struct package_thread_args {
 
 static pthread_mutex_t msg_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/*
-TaskQueue* ready_queue;		// Queue of tasks which are ready to run
-TaskQueue* migrate_queue;       // Queue of tasks which are going to migrate
-TaskQueue* wait_queue;		// Queue of tasks which are waiting for the finish of dependent tasks
-TaskQueue* running_queue;	// Queue of tasks which are being executed
-*/
-
 ofstream fin_fp;
 ofstream log_fp;
 long msg_count[10];
@@ -61,12 +57,9 @@ long task_comp_count = 0;
 
 uint32_t nots = 0, notr = 0;
 
-long start_poll = 1000; long start_thresh = 1000000;
-long end_poll = 100000;	long end_thresh = 10000000;
-int diff_thresh = 500;
-timespec poll_start, poll_end;
-uint64_t failed_attempts = 0;
-uint64_t fail_threshold = 1000;
+uint32_t waitInterval = INITIAL_WAIT_TIME;
+uint32_t waitThreshold = WAIT_THRESHOLD;
+
 int work_steal_signal = 1;
 
 //Worker *worker;
@@ -85,156 +78,145 @@ static string file_migrate_fp;
 static string file_fin_fp;			
 static string file_log_fp;		
 
-static string loadstr, taskstr;
-
 Worker::Worker(char *parameters[], NoVoHT *novoht) {
-	/* set thread detachstate attribute to DETACHED */
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-	pthread_attr_setscope(&attr,PTHREAD_SCOPE_SYSTEM);
-	/* filename definitions */
-	set_dir(parameters[9],parameters[10]);
-	file_worker_start.append(shared);	file_worker_start.append("startinfo");
-	file_task_fp.append(prefix);		file_task_fp.append("pkgs");
-	file_migrate_fp.append(prefix);		file_migrate_fp.append("log_migrate");
-	file_fin_fp.append(prefix);		file_fin_fp.append("finish");
-	file_log_fp.append(prefix);		file_log_fp.append("log_worker");
-	
-	pmap = novoht;
-	Env_var::set_env_var(parameters);
-	svrclient.initialize(Env_var::cfgFile, Env_var::membershipFile, Env_var::TCP);
-	//svrzht.initialize(Env_var::cfgFile, Env_var::membershipFile, Env_var::TCP);
-	//svrmig.initialize(Env_var::cfgFile, Env_var::membershipFile, Env_var::TCP);
+        /* set thread detachstate attribute to DETACHED */
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setscope(&attr,PTHREAD_SCOPE_SYSTEM);
+        /* filename definitions */
+        set_dir(parameters[9],parameters[10]);
+        file_worker_start.append(shared);       file_worker_start.append("startinfo");
+        file_task_fp.append(prefix);            file_task_fp.append("pkgs");
+        file_migrate_fp.append(prefix);         file_migrate_fp.append("log_migrate");
+        file_fin_fp.append(prefix);             file_fin_fp.append("finish");
+        file_log_fp.append(prefix);             file_log_fp.append("log_worker");
 
-	if(set_ip(ip)) {
-		printf("Could not get the IP address of this machine!\n");
-		exit(1);
-	}
-	
-	for(int i = 0; i < 10; i++) {
-		msg_count[i] = 0;
-	}
-	
-	poll_interval = start_poll;
-	poll_threshold = start_thresh;
-	num_nodes = svrclient.memberList.size();
-	num_cores = 4;
-	num_idle_cores = num_cores;
-	neigh_mode = 'd';
-	//worker.num_neigh = (int)(sqrt(worker.num_nodes));
-	num_neigh = (int)(log(num_nodes)/log(2));
-	neigh_index = new int[num_neigh];
-	selfIndex = getSelfIndex(ip, atoi(parameters[1]), svrclient.memberList);	// replace "localhost" with proper hostname, host is the IP in C++ string
-	ostringstream oss;
+        pmap = novoht;
+        Env_var::set_env_var(parameters);
+        svrclient.initialize(Env_var::cfgFile, Env_var::membershipFile, Env_var::TCP);
+        //svrzht.initialize(Env_var::cfgFile, Env_var::membershipFile, Env_var::TCP);
+        //svrmig.initialize(Env_var::cfgFile, Env_var::membershipFile, Env_var::TCP);
+
+        if(set_ip(ip)) {
+                printf("Could not get the IP address of this machine!\n");
+                exit(1);
+        }
+
+        for(int i = 0; i < 10; i++) {
+                msg_count[i] = 0;
+        }
+
+        num_nodes = svrclient.memberList.size();
+        num_cores = NUM_COMPUTE_SLOTS;
+        num_idle_cores = num_cores;
+        neigh_mode = 'd';
+        //worker.num_neigh = (int)(sqrt(worker.num_nodes));
+        num_neigh = (int)(log(num_nodes)/log(2));
+        //neigh_index = new int[num_neigh];
+        selfIndex = getSelfIndex(ip, atoi(parameters[1]), svrclient.memberList);        // replace "localhost" with proper hostname, host is the IP in C++ string
+        ostringstream oss;
         oss << selfIndex;
-	
-	string f1 = file_fin_fp;
-	f1 = f1 + oss.str();
-	fin_fp.open(f1.c_str(), ios_base::app);
+
+        string f1 = file_fin_fp;
+        f1 = f1 + oss.str();
+        fin_fp.open(f1.c_str(), ios_base::app);
 
 	if(LOGGING) {
 
-		string f2 = file_task_fp;
-		f2 = f2 + oss.str();
-		task_fp.open(f2.c_str(), ios_base::app);
+                string f2 = file_task_fp;
+                f2 = f2 + oss.str();
+                task_fp.open(f2.c_str(), ios_base::app);
 
-		string f3 = file_log_fp;
-		f3 = f3 + oss.str();
-		log_fp.open(f3.c_str(), ios_base::app);
-		
-		string f4 = file_migrate_fp;
-		f4 = f4 + oss.str();
-		migrate_fp.open(f4.c_str(), ios_base::app);
-	}
-	
-	migratev = bitvec(num_nodes);
-	
-	Package loadPackage, tasksPackage;
-	string loadmessage("Load Information!");
-	loadPackage.set_virtualpath(loadmessage);
-	loadPackage.set_operation(13);
-	loadstr = loadPackage.SerializeAsString();
-	
-	stringstream selfIndexstream;
-	selfIndexstream << selfIndex;
-	string taskmessage(selfIndexstream.str());
-	tasksPackage.set_virtualpath(taskmessage);
-	tasksPackage.set_operation(14);
-	taskstr = tasksPackage.SerializeAsString();
+                string f3 = file_log_fp;
+                f3 = f3 + oss.str();
+                log_fp.open(f3.c_str(), ios_base::app);
 
-	srand((selfIndex+1)*(selfIndex+5));
-	int rand_wait = rand() % 20;
-	cout << "Worker ip = " << ip << " selfIndex = " << selfIndex << endl;
-	//cout << "Worker ip = " << ip << " selfIndex = " << selfIndex << " going to wait for " << rand_wait << " seconds" << endl;
-	sleep(rand_wait);
+                string f4 = file_migrate_fp;
+                f4 = f4 + oss.str();
+                migrate_fp.open(f4.c_str(), ios_base::app);
+        }
 
-	file_worker_start.append(oss.str());
+        migratev = bitvec(num_nodes);
+
+        srand((selfIndex+1)*(selfIndex+5));
+        int rand_wait = rand() % 20;
+        cout << "Worker ip = " << ip << " selfIndex = " << selfIndex << endl;
+        //cout << "Worker ip = " << ip << " selfIndex = " << selfIndex << " going to wait for " << rand_wait << " seconds" << endl;
+        sleep(rand_wait);
+
+        file_worker_start.append(oss.str());
         string cmd("touch ");
         cmd.append(file_worker_start);
         executeShell(cmd);
-        
+
         worker_start.open(file_worker_start.c_str(), ios_base::app);
         if(worker_start.is_open()) {
-        	worker_start << ip << ":" << selfIndex << " " << std::flush;
-        	worker_start.close();
-        	worker_start.open(file_worker_start.c_str(), ios_base::app);
+                worker_start << ip << ":" << selfIndex << " " << std::flush;
+                worker_start.close();
+                worker_start.open(file_worker_start.c_str(), ios_base::app);
         }
 
-        clock_gettime(CLOCK_REALTIME, &poll_start);
 
-	int err;
-	/*pthread_t *ready_queue_thread = new pthread_t();//(pthread_t*)malloc(sizeof(pthread_t));
-	pthread_create(ready_queue_thread, &attr, check_ready_queue, NULL);*/
+        int err;
+        /*pthread_t *ready_queue_thread = new pthread_t();//(pthread_t*)malloc(sizeof(pthread_t));
+        pthread_create(ready_queue_thread, &attr, check_ready_queue, NULL);*/
 	try {
-	pthread_t *ready_queue_thread = new pthread_t[num_cores];
-	for(int i = 0; i < num_cores; i++) {
-		err = pthread_create(&ready_queue_thread[i], &attr, check_ready_queue, (void*) this);
-		if(err){
-                	printf("work_steal_init: pthread_create: ready_queue_thread: %s\n", strerror(errno));
+        /*pthread_t *ready_queue_thread = new pthread_t[num_cores];
+        for(int i = 0; i < num_cores; i++) {
+                err = pthread_create(&ready_queue_thread[i], &attr, check_ready_queue, (void*) this);
+                if(err){
+                        printf("work_steal_init: pthread_create: ready_queue_thread: %s\n", strerror(errno));
                         exit(1);
                 }
-	}
+        }*/
 
-	pthread_t *wait_queue_thread = new pthread_t();
-	err = pthread_create(wait_queue_thread, &attr, check_wait_queue, (void*) this);
+	pthread_t *ready_queue_thread = new pthread_t();
+	err = pthread_create(ready_queue_thread, &attr, checkReadyQueue, (void*) this);
 	if(err){
+                printf("work_steal_init: pthread_create: ready_queue_thread: %s\n", strerror(errno));
+                exit(1);
+        }
+
+        pthread_t *wait_queue_thread = new pthread_t();
+        err = pthread_create(wait_queue_thread, &attr, checkWaitQueue, (void*) this);
+        if(err){
                 printf("work_steal_init: pthread_create: wait_queue_thread: %s\n", strerror(errno));
                 exit(1);
         }
 
-	pthread_t *complete_queue_thread = new pthread_t();
-        err = pthread_create(complete_queue_thread, &attr, check_complete_queue, (void*) this);
+        pthread_t *complete_queue_thread = new pthread_t();
+        /*err = pthread_create(complete_queue_thread, &attr, checkCompleteQueue, (void*) this);
         if(err){
                 printf("work_steal_init: pthread_create: complete_queue_thread: %s\n", strerror(errno));
                 exit(1);
-        }
-	
-	package_thread_args rq_args, wq_args;
-	rq_args.source = &insertq_new;	wq_args.source = &waitq;
-	rq_args.dest = &rqueue;		wq_args.dest = &wqueue;
-	rq_args.slock = &iq_new_lock;	wq_args.slock = &waitq_lock;
-	rq_args.dlock = &lock;		wq_args.dlock = &w_lock;	
-	rq_args.worker = this;		wq_args.worker = this;
-	pthread_t *waitq_thread = new pthread_t();
-	err = pthread_create(waitq_thread, &attr, HB_insertQ_new, (void*) &wq_args);
-	if(err){
+        }*/
+
+        package_thread_args rq_args, wq_args;
+        rq_args.source = &insertq_new;  wq_args.source = &waitq;
+        rq_args.dest = &rqueue;         wq_args.dest = &wqueue;
+        rq_args.slock = &iq_new_lock;   wq_args.slock = &waitq_lock;
+        rq_args.dlock = &r_lock;          wq_args.dlock = &w_lock;
+        rq_args.worker = this;          wq_args.worker = this;
+        pthread_t *waitq_thread = new pthread_t();
+        err = pthread_create(waitq_thread, &attr, HB_insertQ_new, (void*) &wq_args);
+        if(err){
                 printf("work_steal_init: pthread_create: waitq_thread: %s\n", strerror(errno));
                 exit(1);
         }
 
-	pthread_t *readyq_thread = new pthread_t();
+        pthread_t *readyq_thread = new pthread_t();
         err = pthread_create(readyq_thread, &attr, HB_insertQ_new, (void*) &rq_args);
         if(err){
                 printf("work_steal_init: pthread_create: ready_thread: %s\n", strerror(errno));
                 exit(1);
         }
-	
-	pthread_t *migrateq_thread = new pthread_t();
-        err = pthread_create(migrateq_thread, &attr, migrateTasks, (void*) this);
+
+        pthread_t *migrateq_thread = new pthread_t();
+        /*err = pthread_create(migrateq_thread, &attr, migrateTasks, (void*) this);
         if(err){
                 printf("work_steal_init: pthread_create: migrateq_thread: %s\n", strerror(errno));
                 exit(1);
-        }
+        }*/
 
 	pthread_t *notq_thread = new pthread_t();
         err = pthread_create(notq_thread, &attr, notQueue, (void*) this);
@@ -243,55 +225,39 @@ Worker::Worker(char *parameters[], NoVoHT *novoht) {
                 exit(1);
         }
 
-	int min_lines = svrclient.memberList.size();
-	//min_lines++;	
+        int min_lines = svrclient.memberList.size();
         string filename(file_worker_start);
-        //string cmd("wc -l ");	
-        //cmd = cmd + filename + " | awk {\'print $1\'}";
-	
-	string cmd2("ls -l "); 	cmd2.append(shared);	cmd2.append("startinfo*");	cmd2.append(" | wc -l");
+
+        string cmd2("ls -l ");  cmd2.append(shared);    cmd2.append("startinfo*");      cmd2.append(" | wc -l");
         string result = executeShell(cmd2);
-	//cout << "server: minlines = " << min_lines << " cmd = " << cmd << " result = " << result << endl;
+        //cout << "server: minlines = " << min_lines << " cmd = " << cmd << " result = " << result << endl;
         while(atoi(result.c_str()) < min_lines) {
-		sleep(2);
-		 //cout << "server: " << worker.selfIndex << " minlines = " << min_lines << " cmd = " << cmd << " result = " << result << endl;
+                sleep(2);
+                 //cout << "server: " << worker.selfIndex << " minlines = " << min_lines << " cmd = " << cmd << " result = " << result << endl;
                 result = executeShell(cmd2);
         }
-	//cout << "server: " << selfIndex << " minlines = " << min_lines << " cmd = " << cmd2 << " result = " << result << endl;
-	
-	/*int num = min_lines - 1;
-        stringstream num_ss;
-        num_ss << num;
-        //min_lines++;
-	string cmd1("cat ");    cmd1.append(shared);    cmd1.append("startinfo"); 	cmd1.append(num_ss.str());     cmd1.append(" | wc -l");
-	string result1 = executeShell(cmd1);
-	//cout << "server: minlines = " << min_lines << " cmd = " << cmd << " result = " << result << endl;
-	while(atoi(result1.c_str()) < 1) {
-		sleep(2);
-		result1 = executeShell(cmd1);
-	}
-	cout << "worksteal started: server: " << selfIndex << " minlines = " << 1 << " cmd = " << cmd1 << " result = " << result1 << endl;*/
-	
-    pthread_t *work_steal_thread = new pthread_t();//(pthread_t*)malloc(sizeof(pthread_t));
-	err = pthread_create(work_steal_thread, &attr, worksteal, (void*) this);
-	if(err){
-                printf("work_steal_init: pthread_create: work_steal_thread: %s\n", strerror(errno));
-        	exit(1);
-        }
+        //cout << "server: " << selfIndex << " minlines = " << min_lines << " cmd = " << cmd2 << " result = " << result << endl;
 
-	delete ready_queue_thread;
-	delete wait_queue_thread;
-	delete complete_queue_thread;
-	delete work_steal_thread;
-	delete readyq_thread;
-	delete waitq_thread;
-	delete migrateq_thread;
-	delete notq_thread;
-	}
+	pthread_t *resource_steal_thread = new pthread_t();//(pthread_t*)malloc(sizeof(pthread_t));
+        /*err = pthread_create(resource_steal_thread, &attr, resourcesteal, (void*) this);
+        if(err){
+                printf("work_steal_init: pthread_create: resource_steal_thread: %s\n", strerror(errno));
+                exit(1);
+        }*/
+
+        delete ready_queue_thread;
+        delete wait_queue_thread;
+        delete complete_queue_thread;
+        delete resource_steal_thread;
+        delete readyq_thread;
+        delete waitq_thread;
+        delete migrateq_thread;
+        delete notq_thread;
+        }
 	catch (std::bad_alloc& exc) {
-		cout << "work_steal_init: failed to allocate memory while creating threads" << endl;
-		exit(1);
-	}
+                cout << "work_steal_init: failed to allocate memory while creating threads" << endl;
+                exit(1);
+        }
 }
 
 // parse the input string containing two delimiters
@@ -630,11 +596,11 @@ void* migrateTasks(void *args) {
                         }
 			pthread_mutex_unlock(&mq_lock);
 			//cout << "2 worker = " << worker->selfIndex << " to index = " << index << " size = " << rqueue.size() << endl;
-			pthread_mutex_lock (&m_lock); pthread_mutex_lock (&lock);
+			pthread_mutex_lock (&m_lock); pthread_mutex_lock (&r_lock);
 			int32_t num_tasks = rqueue.size()/2;
 			if(num_tasks < 1) {
-				pthread_mutex_unlock (&lock); pthread_mutex_unlock (&m_lock);
-				continue;;
+				pthread_mutex_unlock (&r_lock); pthread_mutex_unlock (&m_lock);
+				continue;
 			}
 			try {	//cout << "going to send " << num_tasks << " tasks" << endl;
 				mqueue.assign(rqueue.end()-num_tasks, rqueue.end());
@@ -645,7 +611,7 @@ void* migrateTasks(void *args) {
 				cout << "migrateTasks: cannot allocate memory while copying tasks to migrate queue" << endl;
 				pthread_exit(NULL);
 			}
-			pthread_mutex_unlock (&lock);
+			pthread_mutex_unlock (&r_lock);
 
 			map<uint32_t, NodeList> update_map = worker->get_map(mqueue);
 			int update_ret = worker->zht_update(update_map, "nodehistory", index);
@@ -684,14 +650,16 @@ void* migrateTasks(void *args) {
 						break;
         	            		}
                 			try {
-						alltasks.append(mqueue.front()->task_id); alltasks.append("\'\""); // Task ID
-						/*stringstream num_moves_ss;
-			                        num_moves_ss << (mqueue.front()->num_moves + 1);
-						alltasks.append(num_moves_ss.str());  alltasks.append("\'\""); // Number of moves*/
-		
+						alltasks.append(mqueue.front()->task_id); 	alltasks.append("\'"); // Task ID
+						alltasks.append(mqueue.front()->task_desc);	alltasks.append("\'");   // Task Description
+						stringstream num_slots_ss;
+			                        num_slots_ss << (mqueue.front()->num_slots);
+						alltasks.append(num_slots_ss.str());		alltasks.append("\'\""); //Number of compute slots
+
                 			        if(LOGGING) {
 				            		migrate_fp << " taskid = " << mqueue.front()->task_id;
-			                    		//migrate_fp << " num moves = " << (mqueue.front()->num_moves + 1);
+							migrate_fp << " task_desc = " << mqueue.front()->task_desc;
+			                    		migrate_fp << " num slots = " << (mqueue.front()->num_slots);
                     		   		}
 						delete mqueue.front();
 		                   		mqueue.pop_front();
@@ -716,277 +684,82 @@ void* migrateTasks(void *args) {
 	}
 }
 
-//request the worker with given index to send tasks
-int32_t Worker::recv_tasks() {
-//cout << " 3";
-
-	int32_t num_task;
-	pthread_mutex_lock(&msg_lock);
-	num_task = svrclient.svrtosvr(taskstr, taskstr.length(), max_loaded_node);
-	pthread_mutex_unlock(&msg_lock); 
-	/*if(LOGGING) {
-		log_fp << "expected num tasks = " << num_task << endl;
-	}*/
-
-	clock_gettime(CLOCK_REALTIME, &poll_end);
-        timespec diff = timediff(poll_start, poll_end);
-	if(diff.tv_sec > diff_thresh) {
-		poll_threshold = end_thresh;
-	}
-
-	if(num_task > 0) { // there are tasks to receive
-		if(diff.tv_sec > diff_thresh) {
-			poll_interval = end_poll; // reset the poll interval to 1ms
-		}
-		else {
-			poll_interval = start_poll;
-		}
-		//cout << "Worker::recv_tasks num_task = " << num_task << endl;
-		return num_task;
-	}
-
-	else {
-		// no tasks
-		if(poll_interval < poll_threshold) { // increase poll interval only if it is under 1 sec
-			poll_interval *= 2;
-		}
-		return 0;
+void backoff() {
+	usleep(waitInterval);
+	if(waitInterval < waitThreshold) { // increase poll interval only if it is under 1 sec
+		waitInterval *= 2;
 	}
 }
 
+void resetwaitInterval() {
+	waitInterval = INITIAL_WAIT_TIME;
+}
+
 /*
- * Find the neighbor which has the heaviest load
+ * Get compute slots information from each server
  */
-int32_t Worker::get_max_load()
-{	//cout << " in max load " << endl;
-	//max_load_struct* new_max_load;
-	int i;
-	int32_t max_load = -1000000, load;
-	
-	/*new_max_load = (max_load_struct*)malloc(sizeof(max_load_struct));
-	if(new_max_load == NULL){
-        	cout << "Worker::get_max_load: " << strerror(errno) << endl;
-                exit(1);
-        }*/
-	//new_max_load->node_address = (char*)malloc(sizeof(char) * 30);
-	//memset(new_max_load->node_address, '\0', 30);
-	for(i = 0; i < num_neigh; i++)
-	{	//cout << " max load i = " << i << " index = " << neigh_index[i] << endl;
-		// Get Load information
+int32_t Worker::getComputeNodesInfo(ComputeNodesInfo &availSlots, string &task_id) {
+	Package stealPackage;
+        stealPackage.set_virtualpath(task_id);
+        stealPackage.set_operation(14);
+        string stealInfoStr = stealPackage.SerializeAsString();
+
+	ServerSlots &serverslots = availSlots[task_id];
+	int32_t totalSlots = 0;
+	for(ServerSlots::iterator it = serverslots.begin(); it != serverslots.end(); ++it) {
+		uint32_t serverIndex = it->first;
+		if(serverIndex == selfIndex)
+			continue;
 		pthread_mutex_lock(&msg_lock);
-		load = svrclient.svrtosvr(loadstr, loadstr.length(), neigh_index[i]);
+		it->second = svrclient.svrtosvr(stealInfoStr, stealInfoStr.length(), serverIndex);
 		pthread_mutex_unlock(&msg_lock);
-		//cout << "worker = " << selfIndex << " Load = " << load << endl;
-		if(load > max_load)
-		{
-			max_load = load;
-			max_loaded_node = neigh_index[i];
-		}
+		totalSlots += it->second;
 	}
-	//new_max_load->max_load = max_load;
-	//new_max_load->index = max_load_node;
-	//strcpy(new_max_load->node_address, neigh_ips[max_load_node]);
-	//return new_max_load;
-	//cout << "Max load = " << new_max_load->max_load << " index = " << new_max_load->index << endl;
-	return max_load;
+	return totalSlots;
 }
 
 /*
  * Randomly choose neighbors dynamically
  */
-void Worker::choose_neigh()
-{	
-	//time_t t;
-	//srand((unsigned)time(&t));
+void Worker::chooseNeighbours(ComputeNodesInfo &availSlots, string &task_id) {
 	srand(time(NULL));
 	int i, ran;
 	int x;
 	char *flag = new char[num_nodes];
-	//cout << "num nodes = " << num_nodes << " num neigh = " << num_neigh << endl;
-	/*for(i = 0; i < num_nodes; i++)
-	{
-		flag[i] = '0';
-	}*/
 	memset(flag, '0', num_nodes);
-	//cout << "flag array set" << endl;
-	for(i = 0; i < num_neigh; i++)
-	{
-		//cout << " i = " << i << endl;
+
+	ServerSlots serverslots;	
+
+	for(i = 0; i < num_neigh; i++) {
 		ran = rand() % num_nodes;		
 		x = hostComp(svrclient.memberList.at(ran), svrclient.memberList.at(selfIndex));
-		//cout << "ran a " << ran << " " << selfIndex << " " << x << endl;
-		//while(flag[ran] == '1' || !strcmp(all_ips[ran], ip))
-		while(flag[ran] == '1' || !x)
-		{
+		while(flag[ran] == '1' || !x) {
 			ran = rand() % num_nodes;
 			x = hostComp(svrclient.memberList.at(ran), svrclient.memberList.at(selfIndex));
-			//cout << "ran = " << ran << " x = " << x << endl;
 		}
 		flag[ran] = '1';
-		//strcpy(neigh_ips[i], all_ips[ran]);
-		//cout << "i = " << i << " ran = " << ran << endl;
-		neigh_index[i] = ran;
-		//cout << "ran b " << ran << " " << selfIndex << " " << x << endl;
+		serverslots[ran] = 0;
 	}
-	//cout << "neigh index set" << endl;
+	availSlots[task_id] = serverslots;
 	delete flag;
 }
 
 /*
- * Steal tasks from the neighbors
+ * Steal compute slots from the neighbors
  */
-int32_t Worker::steal_task()
-{
-	/*vector<struct HostEntity> nodeList = svrclient.memberList;
-	int *neigh_index;
-	neigh_index = (int*)malloc(sizeof(int) * num_neigh);
-	if(neigh_index == NULL){
-		cout << "Worker::steal_task: " << strerror(errno) << endl;
-		exit(1);
+int32_t Worker::stealSlots(ComputeNodesInfo &availSlots, string &task_id) {
+	chooseNeighbours(availSlots, task_id);
+	int32_t totalSlots = getComputeNodesInfo(availSlots, task_id);
+	while(totalSlots <= 0) {
+		backoff();
+		chooseNeighbours(availSlots, task_id);
+		totalSlots = getComputeNodesInfo(availSlots, task_id);
 	}
-	char flag[num_nodes];
-	int i;
-
-	Package loadPackage, tasksPackage;	
-	string loadmessage("Load Information!");
-	loadPackage.set_virtualpath(loadmessage);
-	loadPackage.set_operation(13);
-	string loadstr = loadPackage.SerializeAsString();
-
-	stringstream selfIndexstream;
-	selfIndexstream << worker.selfIndex;
-	string taskmessage(selfIndexstream.str());
-	tasksPackage.set_virtualpath(taskmessage);
-	tasksPackage.set_operation(14);
-	string taskstr = tasksPackage.SerializeAsString();*/
-
-	/*for(i = 0; i < num_neigh; i++)
-	{
-		neigh_ips[i] = (char*)malloc(sizeof(char) * 30);
-		memset(neigh_ips[i], '\0', 30);
-	}*/
-	//cout << "Entered steal_task" << endl;
-	/*if(LOGGING) {
-                log_fp << "entered steal_task()" << endl;
-        }*/
-	choose_neigh();
-	//cout << "Done choose_neigh" << endl;
-	int32_t max_load = get_max_load();
-	/*if(LOGGING) {
-                log_fp << "Max loaded node = " << max_loaded_node << endl;
-        }*/
-	//cout << "Done get_max_load max_load = " << max_load << " index = " << max_loaded_node << endl;
-	//int index;
-	//max_load_struct* new_max_load;
-	//new_max_load = get_max_load(neigh_index, loadstr);
-	//cout << index << endl;
-	// While all neighbors have no more available tasks,
-	// double the "poll_interval" to steal again
-	while(max_load <= 0 && work_steal_signal)
-	{
-		//cout << "workerid = " << selfIndex << " load = " << max_load << " failed attempts = " << failed_attempts << endl;
-		usleep(poll_interval);	failed_attempts++;
-		clock_gettime(CLOCK_REALTIME, &poll_end);
-        	timespec diff = timediff(poll_start, poll_end);
-        	if(diff.tv_sec > diff_thresh) {
-                	poll_threshold = end_thresh;
-        	}
-
-		if(poll_interval < poll_threshold) { // increase poll interval only if it is under 1 sec
-			poll_interval *= 2;
-		}
-
-		if(failed_attempts >= fail_threshold) {
-			work_steal_signal = 0;
-			//cout << worker.selfIndex << " stopping worksteal" << endl;
-			return 0;
-		}
-		/*if(worker.poll_interval == 1024000) {
-			return 2;
-		}*/
-		//cout << "worker.poll_interval = " << worker.poll_interval << endl;
-		//choose_neigh(neigh_ips, all_ips, flag);
-		//choose_neigh(neigh_index, nodeList, flag);
-		//new_max_load  = get_max_load(neigh_index, loadstr);
-		choose_neigh();
-		max_load = get_max_load();
-		/*if(LOGGING) {
-                	log_fp << "Max loaded node = " << max_loaded_node << endl;
-        	}*/
-	}
-	/*if(LOGGING) {
-		log_fp << "Max loaded node = " << max_loaded_node << endl;
-	}*/
-	failed_attempts = 0;
-	//cout << "workerid = " << selfIndex << " load = " << max_load << endl;
-	//index = new_max_load->index;
-	//cout << "Final index  = " << index << endl;
-	//return recv_tasks(index, taskstr);
-	return recv_tasks();
+	resetwaitInterval();
+	return totalSlots;
 }
 
-// thread to steal tasks it ready queue length becomes zero
-void* worksteal(void* args){
-	//cout << "entered worksteal thread" << endl;
-	Worker *worker = (Worker*)args;
-
-	/*int min_lines = worker->svrclient.memberList.size();
-	//min_lines++;	
-        string filename(file_worker_start);
-        //string cmd("wc -l ");	
-        //cmd = cmd + filename + " | awk {\'print $1\'}";
-	
-	string cmd("ls -l "); 	cmd.append(shared);	cmd.append("startinfo*");	cmd.append(" | wc -l");
-        string result = executeShell(cmd);
-	//cout << "server: minlines = " << min_lines << " cmd = " << cmd << " result = " << result << endl;
-        while(atoi(result.c_str()) < min_lines) {
-		sleep(2);
-		 //cout << "server: " << worker.selfIndex << " minlines = " << min_lines << " cmd = " << cmd << " result = " << result << endl;
-                result = executeShell(cmd);
-        }
-	cout << "server: " << worker->selfIndex << " minlines = " << min_lines << " cmd = " << cmd << " result = " << result << endl;*/
-	
-	int num = worker->svrclient.memberList.size() - 1;
-        stringstream num_ss;
-        num_ss << num;
-        //min_lines++;
-	string cmd1("cat ");    cmd1.append(shared);    cmd1.append("startinfo"); 	cmd1.append(num_ss.str());     cmd1.append(" | wc -l");
-	string result1 = executeShell(cmd1);
-	//cout << "server: minlines = " << min_lines << " cmd = " << cmd << " result = " << result << endl;
-	while(atoi(result1.c_str()) < 1) {
-		sleep(2);
-		result1 = executeShell(cmd1);
-	}
-	//cout << "worksteal started: server: " << worker->selfIndex << " minlines = " << 1 << " cmd = " << cmd1 << " result = " << result1 << endl;
-	
-	while(work_steal_signal) {
-		//while(ready_queue->get_length() > 0) { }
-		while(rqueue.size() > 0) { }
-		
-		// If there are no waiting ready tasks, do work stealing
-		//if (worker.num_nodes > 1 && ready_queue->get_length() < 1)
-		if (worker->num_nodes > 1 && rqueue.size() < 1)
-		{
-			int32_t success = worker->steal_task();			
-			// Do work stealing until succeed
-			while(success == 0)
-			{
-				failed_attempts++;
-				if(failed_attempts >= fail_threshold) {
-                        		work_steal_signal = 0;
-					cout << worker->selfIndex << " stopping worksteal" << endl;
-					break;
-                		}
-				usleep(worker->poll_interval);
-				success = worker->steal_task();				
-			}
-			failed_attempts = 0;
-			//cout << "Received " << success << " tasks" << endl;
-		}
-	}
-}
-
-int Worker::check_if_task_is_ready(string key) {
+int Worker::checkIfTaskIsReady(string key) {
 	int index = myhash(key.c_str(), svrclient.memberList.size());
 	if(index != selfIndex) {
 		Package check_package;
@@ -1006,46 +779,36 @@ int Worker::check_if_task_is_ready(string key) {
 	}
 }
 
-int Worker::move_task_to_ready_queue(TaskQueue_Item **qi) {
-	//pthread_mutex_lock(&w_lock);
-	pthread_mutex_lock(&lock);
+int Worker::moveTaskToReadyQueue(TaskQueue_Item **qi) {
+	pthread_mutex_lock(&r_lock);
 	rqueue.push_back(*qi);
-	//wqueue.erase(*qi);
-	pthread_mutex_unlock(&lock);
-	//pthread_mutex_unlock(&w_lock);
+	pthread_mutex_unlock(&r_lock);
 }
 
-bool check(TaskQueue_Item *qi) {
+bool eraseCondition(TaskQueue_Item *qi) {
 	return qi==NULL;
 }
 
-
-void* check_wait_queue(void* args) {
+void* checkWaitQueue(void* args) {
 	Worker *worker = (Worker*)args;
 	TaskQueue_Item *qi;
         while(ON) {
                 while(wqueue.size() > 0) {
-			//for(TaskQueue::iterator it = wqueue.begin(); it != wqueue.end(); ++it) {
 			int size = wqueue.size();
 			for(int i = 0; i < size; i++) {
-				//qi = *it;
 				qi = wqueue[i];
 				if(qi != NULL) {
-					int status = worker->check_if_task_is_ready(qi->task_id); //cout << "task = " << qi->task_id << " status = " << status << endl;
+					int status = worker->checkIfTaskIsReady(qi->task_id);
 					if(status == 0) {
-						//cout << "task = " << qi->task_id << " status = " << status << endl;
-						int ret = worker->move_task_to_ready_queue(&qi);
+						int ret = worker->moveTaskToReadyQueue(&qi);
 						pthread_mutex_lock(&w_lock);
 						wqueue[i] = NULL;
 						pthread_mutex_unlock(&w_lock);
 					}
-					/*if(status < 0) {
-						cout << "negative numwait" << endl;
-					}*/
 				}
 			}
 			pthread_mutex_lock(&w_lock);
-			TaskQueue::iterator last = remove_if(wqueue.begin(), wqueue.end(), check);
+			TaskQueue::iterator last = remove_if(wqueue.begin(), wqueue.end(), eraseCondition);
 			wqueue.erase(last, wqueue.end());
 			pthread_mutex_unlock(&w_lock);
 			sleep(1);
@@ -1053,26 +816,166 @@ void* check_wait_queue(void* args) {
 	}
 }
 
+uint32_t Worker::freeLockedSlots(string &task_id) {
+	SlotList &slotList = lockedNodes[task_id];
+	ComputeNodesStatus::iterator status_it = nodeStatus.begin();
+	pthread_mutex_lock(&mutex_idle);
+	for(SlotList::iterator list_it = slotList.begin(); list_it != slotList.end(); ++list_it) {
+		nodeStatus[*list_it] = true;
+		num_idle_cores++;
+	}
+	slotList.clear();
+	pthread_mutex_unlock(&mutex_idle);
+	return 0;
+}
+
+int32_t Worker::freeLockedSlots(ComputeNodesInfo &availSlots, string &task_id) {
+	freeLockedSlots(task_id);
+	ServerSlots &serverslots = availSlots[task_id];
+	serverslots.erase(selfIndex);
+	if(serverslots.size() < 1)
+		return 0;
+
+	Package freePackage;
+	freePackage.set_virtualpath(task_id);
+	freePackage.set_operation(13);
+	string freeSlotsStr(freePackage.SerializeAsString());
+	for(ServerSlots::iterator it = serverslots.begin(); it != serverslots.end(); ++it) {
+                uint32_t serverIndex = it->first;
+                if(serverIndex == selfIndex)
+                        continue;
+                pthread_mutex_lock(&msg_lock);
+                int ret = svrclient.svrtosvr(freeSlotsStr, freeSlotsStr.length(), serverIndex);
+                pthread_mutex_unlock(&msg_lock);
+        }
+	availSlots.erase(task_id);
+        return 0;	
+}
+
+uint32_t Worker::getHalfSlots(string &task_id) {
+	pthread_mutex_lock(&mutex_idle);
+	uint32_t slots_locked = num_idle_cores/2;
+	if(slots_locked < 1) {
+		pthread_mutex_unlock(&mutex_idle);
+		return 0;
+	}
+	num_idle_cores -= slots_locked;
+	ComputeNodesStatus::iterator status_it = nodeStatus.begin();
+	int i = 0;
+	SlotList slotList;
+	while(status_it != nodeStatus.end()) {
+		if(status_it->second) {
+			status_it->second = false;
+			slotList.push_back(status_it->first);
+			i++;
+		}
+		if(i == slots_locked) {
+			break;
+		}
+		++status_it;
+	}
+	pthread_mutex_unlock(&mutex_idle);
+	lockedNodes[task_id] = slotList;
+	return slots_locked;
+}
+
+ComputeNodesInfo Worker::getAvailSlotsInfo(uint32_t &numAvailSlots, string &task_id, uint32_t &reqdSlots) {
+	ComputeNodesInfo availSlots;
+	uint32_t slotsLocked = getHalfSlots(task_id);
+	numAvailSlots = slotsLocked;
+	if (num_nodes <= 1 || reqdSlots <= slotsLocked) {
+		ServerSlots &serverslots = availSlots[task_id];
+		serverslots[selfIndex] = slotsLocked;
+		return availSlots;
+	}
+	numAvailSlots += stealSlots(availSlots, task_id);
+	ServerSlots &serverslots = availSlots[task_id];
+        serverslots[selfIndex] = slotsLocked;
+	return availSlots;
+}
+
+bool Worker::checkIfReqdSlotsAvail(TaskQueue_Item *qi, uint32_t &numAvailSlots){
+	return (qi->num_slots<=numAvailSlots);
+}
+
+void* checkReadyQueue(void* args) {
+
+	Worker *worker = (Worker*)args;
+	TaskQueue_Item *qi;
+        while(ON) {
+                while(rqueue.size() > 0) {
+                        uint32_t numAvailSlots = 0;
+                        ComputeNodesInfo availSlots;
+			int exec_flag = 0;
+
+			int size = rqueue.size();
+			for(int i = 0; i < size; i++) {
+				qi = rqueue[i];
+				if(qi != NULL) {
+					availSlots = worker->getAvailSlotsInfo(numAvailSlots, qi->task_id, qi->num_slots);
+					bool ready = worker->checkIfReqdSlotsAvail(qi, numAvailSlots);
+					if(ready) {
+						int ret = worker->executeTask(qi, availSlots[qi->task_id]);
+						pthread_mutex_lock(&r_lock);
+						rqueue[i] = NULL;
+						pthread_mutex_unlock(&r_lock);
+						exec_flag = 1;
+						//break;
+					}
+					else {
+                		                int ret = worker->freeLockedSlots(availSlots, qi->task_id);
+                        		}
+				}
+			}
+			if(!exec_flag) {
+				backoff();
+			}
+			pthread_mutex_lock(&r_lock);
+			TaskQueue::iterator last = remove_if(rqueue.begin(), rqueue.end(), eraseCondition);
+			rqueue.erase(last, rqueue.end());
+			pthread_mutex_unlock(&r_lock);
+			//sleep(1);
+		}
+	}
+}
+
+int32_t Worker::executeTask(TaskQueue_Item *qi, ServerSlots &serverslots) {
+	Package execPackage;
+        execPackage.set_virtualpath(task_id);
+        execPackage.set_operation(12);
+        string execlotsStr(execPackage.SerializeAsString());
+	for(ServerSlots::iterator it = serverslots.begin(); it != serverslots.end(); ++it) {
+                uint32_t serverIndex = it->first;
+                if(serverIndex == selfIndex) {
+			
+                        continue;
+		}
+                pthread_mutex_lock(&msg_lock);
+                int ret = svrclient.svrtosvr(execSlotsStr, execSlotsStr.length(), serverIndex);
+                pthread_mutex_unlock(&msg_lock);
+        }
+}
+
 static int work_exec_flag = 0;
 // thread to monitor ready queue and execute tasks based on num of cores availability
-void* check_ready_queue(void* args) {
+void* executeThread(void* args) {
 
 	Worker *worker = (Worker*)args;
 
 	TaskQueue_Item *qi;
 	while(ON) {
 		while(rqueue.size() > 0) {
-				pthread_mutex_lock(&lock);
+				pthread_mutex_lock(&r_lock);
 					if(rqueue.size() > 0) {						
 						qi = rqueue.front();
 						rqueue.pop_front();
 					}
 					else {
-						pthread_mutex_unlock(&lock);
+						pthread_mutex_unlock(&r_lock);
 						continue;
 					}
 				
-                                pthread_mutex_unlock(&lock);
+                                pthread_mutex_unlock(&r_lock);
 
                                 pthread_mutex_lock(&mutex_idle);
                                 worker->num_idle_cores--;
@@ -1083,19 +986,18 @@ void* check_ready_queue(void* args) {
 					worker_start << worker->ip << ":" << worker->selfIndex << " Got jobs..Started excuting" << endl;
 				}
 
+				long duration;
+				stringstream duration_ss;
+				duration_ss << qi->task_desc;
+				duration_ss >> duration;
+
 				//cout << "task to lookup = " << qi->task_id << endl;
 				string value = worker->zht_lookup(qi->task_id);
 				Package recv_pkg;
 			        recv_pkg.ParseFromString(value); //cout << "check_ready_queue: task " << qi->task_id << " node history = " << recv_pkg.nodehistory() << endl;
 				int num_vector_count, per_vector_count;
 	                        vector< vector<string> > tokenize_string = tokenize(recv_pkg.realfullpath(), '\"', '\'', num_vector_count, per_vector_count);
-				//cout << "worker " << worker->selfIndex<< " pertask processing done" << endl;
-				/*cout << "task = " << qi->task_id << " notify list: ";
-				for(int l = 0; l < tokenize_string.at(1).size(); l++) {
-					cout << tokenize_string.at(1).at(l) << " ";
-				} cout << endl;*/
 				
-				stringstream duration_ss;
 				try {
 					duration_ss <<  tokenize_string.at(0).at(1);
 				}
@@ -1105,7 +1007,6 @@ void* check_ready_queue(void* args) {
 					cout << "void* check_ready_queue: value = " << value << endl;
                                         exit(1);
                                 }
-				long duration;
 				//duration = 1000000;
 				duration_ss >> duration;
 
@@ -1154,7 +1055,7 @@ void* check_ready_queue(void* args) {
 				if(LOGGING) {
 					string fin_str;
 					stringstream out;
-					out << qi->task_id << "+" << client_id << " exitcode " << " node history = " << recv_pkg.nodehistory() << exit_code << " Interval " << diff.tv_sec << " S  " << diff.tv_nsec << " NS" << " server " << worker->ip;
+					out << qi->task_id << " exitcode " << exit_code << " Interval " << diff.tv_sec << " S  " << diff.tv_nsec << " NS" << " server " << worker->ip;
 					fin_str = out.str();
 					pthread_mutex_lock(&mutex_finish);
 					fin_fp << fin_str << endl;
@@ -1176,7 +1077,7 @@ int Worker::notify(ComPair &compair) {
 	} cout << endl;*/
 }
 
-void* check_complete_queue(void* args) {
+void* checkCompleteQueue(void* args) {
 	Worker *worker = (Worker*)args;
 
         ComPair compair;
@@ -1199,6 +1100,10 @@ void* check_complete_queue(void* args) {
 
 int32_t Worker::get_load_info() {
 	return (rqueue.size() - num_idle_cores);
+}
+
+int32_t Worker::get_compute_slots_info() {
+	return num_idle_cores;
 }
 
 int32_t Worker::get_monitoring_info() {
